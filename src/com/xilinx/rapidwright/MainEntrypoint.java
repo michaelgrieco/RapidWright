@@ -98,6 +98,7 @@ import com.xilinx.rapidwright.placer.handplacer.ModuleOptimizer;
 import com.xilinx.rapidwright.router.RouteThruHelper;
 import com.xilinx.rapidwright.router.Router;
 import com.xilinx.rapidwright.router.RoutingHeatMap;
+import com.xilinx.rapidwright.rwroute.ComposablePAT;
 import com.xilinx.rapidwright.rwroute.CUFR;
 import com.xilinx.rapidwright.rwroute.PartialCUFR;
 import com.xilinx.rapidwright.rwroute.PartialDFXRouter;
@@ -144,6 +145,7 @@ public class MainEntrypoint {
         addFunction("BrowseDevice", BrowseDevice::main);
         addFunction("CheckAccuracyUsingGnlDesigns", CheckAccuracyUsingGnlDesigns::main);
         addFunction("CompareRouteStatusReports", CompareRouteStatusReports::main);
+        addFunction("ComposablePAT", ComposablePAT::main);
         addFunction("CopyMMCMCell", CopyMMCMCell::main);
         addFunction("CopyImplementation", CopyImplementation::main);
         addFunction("CountRoutedNets", CountRoutedNets::main);
