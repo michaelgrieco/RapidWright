@@ -52,14 +52,18 @@ import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.AbstractMap;
 import java.util.Map;
 import java.util.Map.Entry;
+import static java.util.Map.entry;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.io.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * RWRoute class provides the main methods for routing a design.
@@ -242,87 +246,43 @@ public class ComposablePAT {
 
     }
 
-    public static void moduleInst(String[] args) {
-
-        if (args.length < 4) {
-            System.out.println("USAGE: <dcp_path> <blueprint_pblock> <blueprint_range> <blueprint_idx>");
-            return;
-        }
-
-        String blueprint_pblock = args[1];
-        String blueprint_pblock_range = args[2];
-        String blueprint_dcp_path = args[0] + "/" + blueprint_pblock + "_processing_element_identity_route_design.dcp";
-        String blueprint_edif_path = args[0] + "/" + blueprint_pblock + "_processing_element_identity_route_design.edif";
-        String transformed_dcp_path = args[0] + "/" + blueprint_pblock + "_processing_element_identity_route_design.test.dcp";
-        int blueprint_idx = Integer.parseInt(args[3]);
-        if (blueprint_idx >= NUM_PES) {
-            System.out.printf("ERROR: blueprint index, %d, is too large (>= %d)\n", blueprint_idx, NUM_PES);
-        }
-
-        // original design
-        Design ogDesign = Design.readCheckpoint(blueprint_dcp_path, blueprint_edif_path);
-        Module mod = new Module(ogDesign);
-        PBlock pblock = new PBlock(ogDesign.getDevice(), blueprint_pblock_range);
-        EDIFNetlist netlist = ogDesign.getNetlist();
-
-        for (EDIFPort p : netlist.getTopCell().getPorts()) {
-            String name = p.toString();
-            System.out.printf("EDIF port %s\n", name);
-            for (int i = 0; i < p.getWidth(); i++) {
-                EDIFNet en = p.getInternalNet(i);
-                name = en.toString();
-                Net n = ogDesign.getNet(name);
-                if (n != null) {
-                    System.out.printf(" => Design net %s\n", n.toString());
-                }
-                List<PartitionPin> ppins = ogDesign.getPartitionPins(n);
-                for (PartitionPin ppin : ppins) {
-                    System.out.printf("   => Partition pin %s\n", ppin.toString());
-                }
-            }
-        }
-
-/*
-        // new design
-        Design design = new Design("top", ogDesign.getDevice().toString());
-
-        design.getNetlist().migrateCellAndSubCells(mod.getNetlist().getTopCell());
-        ModuleInst inst = design.createModuleInst("inst", mod);
-        inst.place(mod.getAnchor());
-
-        design.writeCheckpoint(transformed_dcp_path);
-*/
-
-    }
-
-    private static void printOrNull(String format, Object o) {
-        if (o == null) {
-            System.out.printf(format, "NULL");
-        }
-        else {
-            System.out.printf(format, o.toString());
-        }
-    }
+    // =====================
+    // ===== constants =====
+    // =====================
 
     public static final int MESH_ROWS = 4;
     public static final int MESH_COLS = 4;
 
-    private int mesh_rows = 4;
-    private int mesh_cols = 4;
+    // slice x-coordinate boundaries of regions between the
+    public static final int[][] GUTTER_BOUNDS_SLICE_X = {
+        // x0, x1
+        {73, 78},
+        {81, 83},
+        {86, 88}
+    };
 
-    String blueprint_pblock;
-    String blueprint_pblock_range;
-    String static_dcp_path;
-    String static_edif_path;
-    String static_netlist_path;
-    String routed_dcp_path;
-    String inter_pe_nets_path;
-    int blueprint_idx;
+    public static final int[] PE_TILE_X = {
+        44,
+        49,
+        52,
+        55
+    };
+
+    // ===========================
+    // ===== parse arguments =====
+    // ===========================
+
+    private String blueprint_pblock;
+    private String blueprint_pblock_range;
+    private String static_dcp_path;
+    private String static_edif_path;
+    private String static_netlist_path;
+    private String routed_blueprint_dcp_path;
+    private String routed_dcp_path;
+    private String inter_pe_nets_path;
+    private int blueprint_idx;
 
     public ComposablePAT(String[] args) {
-        // ===========================
-        // ===== parse arguments =====
-        // ===========================
 
         if (args.length < 4) {
             System.out.println("USAGE: <dcp_path> <blueprint_pblock> <blueprint_range> <blueprint_idx>");
@@ -333,6 +293,7 @@ public class ComposablePAT {
         blueprint_pblock_range = args[2];
         static_dcp_path = args[0] + "/" + "bitfusion_wrapper_route_design_clock.dcp";
         static_edif_path = args[0] + "/" + "bitfusion_wrapper_route_design_clock.edif";
+        routed_blueprint_dcp_path = args[0] + "/" + "bitfusion_wrapper_route_design_blueprint.dcp";
         routed_dcp_path = args[0] + "/" + "bitfusion_wrapper_route_design_inter.dcp";
         static_netlist_path = args[0] + "/" + "bitfusion_wrapper_route_design_inter.edif";
         inter_pe_nets_path = args[0] + "/" + "rapidwright_nets.txt";
@@ -342,111 +303,348 @@ public class ComposablePAT {
         }
     }
 
-    private void routeInterPENet(Design design, Router router, String net, String source_cell, String sink_cell, String source_site_pin, String sink_site_pin) {
-        ArrayList<SitePinInst> targetPins = new ArrayList<SitePinInst>();
-
-        Net targetNet = design.getNet(net);
-
-        // get driver
-        Cell sourceCell = design.getCell(source_cell);
-        if (sourceCell == null) {
-            System.out.printf("  Could not find driver cell %s\n", source_cell);
+    // get the SitePinInst corresponding to a placed cell
+    private static SitePinInst getSitePinInst(Design design, String cell_path, String site_pin, boolean is_driver, Net net) {
+        // get cell and placed site
+        Cell cell = design.getCell(cell_path);
+        if (cell == null) {
+            return null;
         }
-        SiteInst targetInst = sourceCell.getSiteInst();
-        SitePinInst sourcePinInst = new SitePinInst(true, source_site_pin, targetInst);
-        sourcePinInst.setNet(targetNet);
-        targetNet.setSource(sourcePinInst);
+        SiteInst site_inst = cell.getSiteInst();
 
-        // get load
-        Cell sinkCell = design.getCell(sink_cell);
-        if (sinkCell == null) {
-            System.out.printf("  Could not find load cell %s\n", sink_cell);
+        // get pin in site
+        SitePinInst pin_inst = site_inst.getSitePinInst(site_pin);
+        if (pin_inst == null) {
+            pin_inst = new SitePinInst(is_driver, site_pin, site_inst);
         }
-        targetInst = sinkCell.getSiteInst();
-        SitePinInst sinkPinInst = new SitePinInst(false, sink_site_pin, targetInst);
-        sinkPinInst.setNet(targetNet);
-        targetPins.add(sinkPinInst);
 
-        System.out.printf("Routing to %d pins\n", targetPins.size());
-        System.out.printf("Routing from %s (pin %s) to %s (pin %s)\n", sourceCell.toString(), sourcePinInst.toString(), sinkCell.toString(), sinkPinInst.toString());
+        // associate pin with net
+        if (is_driver) {
+            net.setSource(pin_inst);
+        }
+        else {
+            pin_inst.setNet(net);
+        }
 
-        router.routePinsReEntrant(targetPins, false);
+        return pin_inst;
     }
 
-    public static String getPBlockRange(int x0, int x1, int y0, int y1) {
+    // ===========================
+    // ===== routing methods =====
+    // ===========================
+
+    private static String extendPBlock(Design design, String original_pblock, String new_cell) {
+        Cell cell = design.getCell(new_cell);
+        SiteInst inst = cell.getSiteInst();
+        Site site = inst.getSite();
+        int x0 = site.getInstanceX();
+        int y0 = site.getInstanceY();
+        String pblock = inst.getSiteName();
+        pblock = pblock + ":" + pblock;
+        return getPBlockRange(x0, x0, y0-4, y0+4) + " " + original_pblock;
+    }
+
+    // route a net from a source to a sink with specified pins
+    private Net routeInterPENetPins(Design design, Router router, StaticConnection connection) {
+        ArrayList<SitePinInst> targetPins = new ArrayList<SitePinInst>();
+
+        // get net
+        Net targetNet = design.getNet(connection.net);
+
+        // get driver
+        SitePinInst sourcePinInst = getSitePinInst(design, connection.source_cell, connection.source_site_pin, true, targetNet);
+
+        // get load
+        SitePinInst sinkPinInst = getSitePinInst(design, connection.sink_cell, connection.sink_site_pin, false, targetNet);
+        targetPins.add(sinkPinInst);
+
+        // extend pblock to gutter and load cell
+        router.setRoutingPblock(new PBlock(design.getDevice(),
+            extendPBlock(design, router.getRoutingPblock().toString(), connection.sink_cell)));
+        System.out.printf("  PBlock is %s\n", router.getRoutingPblock().toString());
+
+        System.out.printf("Routing to %d pins\n", targetPins.size());
+        System.out.printf("Routing from pin %s to pin %s (cell %s)\n", sourcePinInst.toString(), sinkPinInst.toString(), connection.sink_cell);
+
+        router.routePinsReEntrant(targetPins, false);
+
+        connection.net_obj = targetNet;
+        return targetNet;
+    }
+
+    // create a connection for a net with specified site pins and a partition node
+    private static int connection_id = 0;
+    private Design routeInterPENetPartition(Design design, String pblock, StaticConnection static_connection) {
+        // create router
+        RWRouteConfig router_config = new RWRouteConfig(new String[]{});
+        router_config.setPBlock(extendPBlock(design, pblock, static_connection.sink_cell));
+        //RWRoute router = new RWRoute(design, router_config);
+        RouteNodeGraph graph = new RouteNodeGraph(design, router_config);
+
+        // scope to one net
+        Net targetNet = design.getNet(static_connection.net);
+        NetWrapper netWrapper = new NetWrapper(connection_id++, targetNet);
+
+        // get driver and load
+        SitePinInst sourcePinInst = getSitePinInst(design, static_connection.source_cell, static_connection.source_site_pin, true, targetNet);
+        SitePinInst sinkPinInst = getSitePinInst(design, static_connection.sink_cell, static_connection.sink_site_pin, false, targetNet);
+
+        // create connection
+        Connection c = new Connection(connection_id++, sourcePinInst, sinkPinInst, netWrapper);
+
+        // add intermediate nodes to connection
+        Collection<SitePinInst> pins = Collections.EMPTY_SET;
+        if (static_connection.partition_node != null) {
+            System.out.printf("Constraining net %s to route through node %s\n", targetNet.toString(), static_connection.partition_node.toString());
+            c.addRnode(graph.getOrCreate(static_connection.partition_node));
+            pins = Collections.singleton(c.getSource());
+        }
+
+        // perform routing
+        // TODO focus on connection c or graph
+        RWRoute router = new PartialRouter(design, router_config, pins);
+        router.preprocess();
+        router.initialize();
+        router.route();
+
+        return router.getDesign();
+
+        // add partition pin from source
+        // not necessary because routing from router
+        //targetPins.add()
+        // but must route from PE to router
+
+        // add partition pin entering destination PE
+        //SitePinInst partitionPinInst = new SitePinInst(false, sink_partition_pin);
+
+        //SiteInst partitionSiteInst = design.createSiteInst(design.getDevice().getSite(sink_partition_pin_site));
+        //Wire partitionWire = new Wire(design.getDevice(), sink_partition_pin);
+        //Node partitionNode = partitionWire.getNode();
+        // go from wire to site pin
+        //SitePinInst partitionPinInst = new SitePinInst(false, xxx, partitionSiteInst);
+        //SitePinInst sitePin = targetNet.createPin("A_O", siteInst);
+        //Wire sink_node = new RouteNode(sink_wire.getTile(), sink_wire.getWireIndex());
+    }
+
+    // construct a PBlock range string from slice coordinates
+    private static String getPBlockRange(int x0, int x1, int y0, int y1) {
         return "SLICE_X" + Integer.toString(x0)
                     + "Y" + Integer.toString(y0)
                     + ":SLICE_X" + Integer.toString(x1)
                     + "Y" + Integer.toString(y1);
     }
 
-    public static final int[][] GUTTER_ENCODING = {
-        // x0, x1
-        {73, 78},
-        {81, 83},
-        {86, 88}
-    };
+    // ========================
+    // ===== flow methods =====
+    // ========================
 
-    private HashMap<String, Integer> sink_cell_r_offset;
-    private HashMap<String, Integer> sink_cell_c_offset;
+    private static class StaticConnection {
 
-    private void routeInterPERegion(Design design, Router router, int r, int c)  throws Exception {
-        BufferedReader reader = new BufferedReader(new FileReader(inter_pe_nets_path));
+        // direction of travel
+        public String direction;
+        boolean crosses_pblock;
 
-        int x0 = GUTTER_ENCODING[c][0];
-        int x1 = GUTTER_ENCODING[c][1];
-        int y0 = (3 - r) * 60;
-        int y1 = y0 + 119;
+        // cell-specific nets and cells
+        String net_format;
+        String source_cell_format;
+        String sink_cell_format;
+        String net;
+        String source_cell;
+        String sink_cell;
 
-       // SLICE_X81Y120:SLICE_X83Y239
+        // pins
+        String source_site_pin;
+        String sink_site_pin;
 
-        String base_range = getPBlockRange(x0, x1, y0, y1);
-        HashMap<String, String> pblock_extensions = new HashMap<String, String>();
-        pblock_extensions.put("east", getPBlockRange(x1+1, x1+1, y0+60, y1));
-        pblock_extensions.put("southeast", getPBlockRange(x1+1, x1+1, y0, y1 - 60));
-        pblock_extensions.put("south", " ");
+        // routed net object
+        Net net_obj;
 
-        if (sink_cell_r_offset == null) {
-            sink_cell_r_offset = new HashMap<String, Integer>();
-            sink_cell_r_offset.put("east", 0);
-            sink_cell_r_offset.put("southeast", 1);
-            sink_cell_r_offset.put("south", 1);
+        // partition pin for receiving pblock relative to blueprint pblock
+        public Wire partition_wire_blueprint;
+        public int partition_wire_blueprint_tile_y;
+        public String partition_wire_format;
+        public Node partition_node;
 
-            sink_cell_c_offset = new HashMap<String, Integer>();
-            sink_cell_c_offset.put("east", 1);
-            sink_cell_c_offset.put("southeast", 1);
-            sink_cell_c_offset.put("south", 0);
+        // blueprint metadata
+        public static int blueprint_r;
+        public static int blueprint_c;
+
+        // map output direction to destination relative to source pblock
+        private static final Map<String, Integer> SINK_CELL_R_OFFSET = Map.ofEntries(
+            entry("east", 0),
+            entry("southeast", 1),
+            entry("south", 1)
+        );
+        private static final Map<String, Integer> SINK_CELL_C_OFFSET = Map.ofEntries(
+            entry("east", 1),
+            entry("southeast", 1),
+            entry("south", 0)
+        );
+
+        public StaticConnection(String direction, BufferedReader reader) throws IOException {
+            this.direction = direction;
+            this.crosses_pblock = !direction.equals("south");
+            this.net_format = reader.readLine();
+            this.source_cell_format = reader.readLine();
+            this.sink_cell_format = reader.readLine();
+            this.source_site_pin = reader.readLine();
+            this.sink_site_pin = reader.readLine();
+            this.partition_node = null;
         }
 
+        public void format_blueprint(Device device, int r, int c, boolean is_blueprint) {
+            int sink_c = c + SINK_CELL_C_OFFSET.get(this.direction);
+
+            this.net = String.format(this.net_format, r, c);
+            this.source_cell = String.format(this.source_cell_format, r, c);
+            this.sink_cell = String.format(this.sink_cell_format,
+                r + SINK_CELL_R_OFFSET.get(this.direction),
+                sink_c);
+
+            if (!is_blueprint && this.partition_wire_blueprint != null) {
+                // compute site offset relative to the blueprint
+                int tile_dy = (StaticConnection.blueprint_r - r) * 60;
+                String wire_name = String.format(this.partition_wire_format, PE_TILE_X[sink_c], this.partition_wire_blueprint_tile_y + tile_dy); // this.partition_node_format
+                System.out.printf("Transforming to net %s\n", this.net);
+                System.out.printf("  Maps to wire %s with dy %d from %d\n", wire_name, tile_dy, this.partition_wire_blueprint_tile_y);
+
+                // search for node
+                this.partition_node = device.getWire(wire_name).getNode();
+            }
+
+            if (is_blueprint) {
+                StaticConnection.blueprint_r = r;
+                StaticConnection.blueprint_c = c;
+            }
+        }
+
+        public void format(Device device, int r, int c) {
+            format_blueprint(device, r, c, false);
+        }
+
+        public void computePartitionPin(int x1) {
+
+            if (this.net_obj == null || !this.crosses_pblock) {
+                return;
+            }
+
+            // get all nodes on the net
+            Collection<Node> nodes = RouterHelper.getNodesOfNet(this.net_obj);
+
+            System.out.printf("For net %s\n", this.net_obj.toString());
+
+            // iterate to find those on the partition boundary
+            Wire partitionWire = null;
+            for (Node node : nodes) {
+                Wire[] wires = node.getAllWiresInNode();
+                int i;
+                for (i = 0; i < wires.length; ++i) {
+                    partitionWire = wires[i];
+
+                    // ensure site is in receiving pblock
+                    Tile tile = partitionWire.getTile();
+                    Site[] sites = tile.getSites();
+                    if (sites.length == 0 || sites[0].getInstanceX() != x1+1) {
+                        continue;
+                    }
+
+                    // check that the wire crosses the tile boundary
+                    Pattern pattern = Pattern.compile(".*BUS(IN|OUT).*");
+                    Matcher matcher = pattern.matcher(partitionWire.toString());
+                    if (matcher.find()) {
+                        //System.out.printf("Found match for wire %s\n", partitionWire.toString());
+                        break;
+                    }
+                }
+
+                if (i < wires.length) {
+                    break;
+                }
+            }
+
+            // save partition node
+            this.partition_wire_blueprint = partitionWire;
+            System.out.printf("Partition wire is %s\n", partitionWire.toString());
+
+            // generate formatting string
+            // CLEM_X52Y179/EASTBUSIN_FT0_43 => CLEM_X%dY%d/EASTBUSIN_FT0_43
+            String[] tokens = partitionWire.toString().split("[XY/]");
+            this.partition_wire_blueprint_tile_y = Integer.parseInt(tokens[2]);
+            this.partition_wire_format = tokens[0] + "X%dY%d/" + tokens[3];
+
+            System.out.printf("  Y is %d and format is %s\n", this.partition_wire_blueprint_tile_y, this.partition_wire_format);
+        }
+
+    }
+
+    // route all nets leaving the specified processing element region
+    private ArrayList<StaticConnection> routeBlueprintPERegion(Design design, Router router) throws Exception {
+
+        int r = blueprint_idx / MESH_COLS;
+        int c = blueprint_idx % MESH_COLS;
+
+        // construct base pblock range
+        int x0 = GUTTER_BOUNDS_SLICE_X[c][0];
+        int x1 = GUTTER_BOUNDS_SLICE_X[c][1];
+        int y0 = (3 - r) * 60;
+        int y1 = y0 + 119;
+        String base_range = getPBlockRange(x0, x1, y0, y1);
+
+        // iterate through each net and find metadata
         String prev_dir = null;
+        ArrayList<StaticConnection> nets = new ArrayList<StaticConnection>();
+        //ArrayList<AbstractMap.SimpleEntry<String, Net>> nets = new ArrayList<AbstractMap.SimpleEntry<String, Net>>();
+        BufferedReader reader = new BufferedReader(new FileReader(inter_pe_nets_path));
         while (true) {
             // read new entry
             String direction = reader.readLine();
             if (direction == null) break;
 
             // do not route southbound signals in last row
-
             if (direction != "east" && r == 3) continue;
-            // construct pblock for direction
-            if (direction != prev_dir) {
-                String pblock_range = base_range + " " + pblock_extensions.get(direction);
-                router.setRoutingPblock(new PBlock(design.getDevice(), pblock_range));
-                prev_dir = direction;
-            }
-            System.out.printf("PBlock for direction %s is %s\n", direction, router.getRoutingPblock().toString());
 
-            // transform names
-            String net = String.format(reader.readLine(), r, c);
-            String source_cell = String.format(reader.readLine(), r, c);
-            String sink_cell = String.format(reader.readLine(),
-                r + sink_cell_r_offset.get(direction),
-                c + sink_cell_c_offset.get(direction));
-            String source_site_pin = reader.readLine();
-            String sink_site_pin = reader.readLine();
+            // reset pblock
+            router.setRoutingPblock(new PBlock(design.getDevice(), base_range));
+
+            // read and transform names
+            StaticConnection connection = new StaticConnection(direction, reader);
+            connection.format_blueprint(design.getDevice(), r, c, true);
 
             // route
-            routeInterPENet(design, router, net, source_cell, sink_cell, source_site_pin, sink_site_pin);
+            routeInterPENetPins(design, router, connection);
+            nets.add(connection);
         }
+
+        // find partition nodes for each net
+        //for (AbstractMap.SimpleEntry<String, Net> entry : nets) {
+        for (StaticConnection connection : nets) {
+            connection.computePartitionPin(x1);
+        }
+
+        return nets;
+    }
+
+    private Design routeInterPERegion(Design design, ArrayList<StaticConnection> static_connections, int r, int c) {
+
+        // construct base pblock range
+        int x0 = GUTTER_BOUNDS_SLICE_X[c][0];
+        int x1 = GUTTER_BOUNDS_SLICE_X[c][1];
+        int y0 = (3 - r) * 60;
+        int y1 = y0 + 119;
+        String base_range = getPBlockRange(x0, x1, y0, y1);
+
+        //ArrayList<Connection> connections = new ArrayList<Connection>();
+        for (StaticConnection static_connection : static_connections) {
+            System.out.printf("Routing connection %s to (%d, %d)\n", static_connection.net_format, r, c);
+            static_connection.format(design.getDevice(), r, c);
+            design = routeInterPENetPartition(
+                design,
+                base_range,
+                static_connection
+            );
+        }
+
+        return design;
     }
 
     public void routePartial(CodePerfTracker t) throws Exception {
@@ -455,32 +653,50 @@ public class ComposablePAT {
         // ===== Parse design =====
         // ========================
 
-        // original design
-        Design design = Design.readCheckpoint(static_dcp_path, static_edif_path, t);
-        //PhysNetlistWriter.writePhysNetlist(design, static_netlist_path);
+        System.out.printf("Reading checkpoint from %s\n", static_dcp_path);
+        Design design = Design.readCheckpoint(static_dcp_path, t);
 
-        // target pins
-        ArrayList<SitePinInst> targetPins = new ArrayList<SitePinInst>();
+        // compute tile-based boundaries for gutters
+        //Device device = design.getDevice();
+        //for (int i = 0; i < GUTTER_BOUNDS_SLICE_X.length; ++i) {
+        //    String site_name = "SLICE_X" + Integer.toString(GUTTER_BOUNDS_SLICE_X[i][0]) + "Y0";
+        //    Site site = device.getSite(site_name);
+        //    Tile tile = site.getTile();
+        //}
+
+        // =====================================
+        // ===== Generate blueprint region =====
+        // =====================================
+
+        Router router = new Router(design);
+        ArrayList<StaticConnection> connections;
+
+        try {
+            connections = routeBlueprintPERegion(design, router);
+        } catch (Exception e) {
+            System.out.printf("Blueprint routing for blueprint gutter failed\n");
+            System.out.println(e.toString());
+            return;
+        }
+
+        router.getDesign().writeCheckpoint(routed_blueprint_dcp_path, t);
 
         // ====================================
         // ===== For all inter-PE regions =====
         // ====================================
 
-        Router router = new Router(design);
-
+        int i = 0;
         for (int c = 0; c < MESH_COLS - 1; ++c) {
-            for (int r = 0; r < MESH_ROWS; ++r) {
-                try {
-                    routeInterPERegion(design, router, r, c);
-                } catch (Exception e) {
-                    System.out.printf("Route for gutter %d,%d failed\n", r, c);
-                    System.out.println(e.toString());
-                    return;
+            for (int r = 0; r < MESH_ROWS; ++r, ++i) {
+                if (i != blueprint_idx) {
+                    design = routeInterPERegion(design, connections, r, c);
+                    break;
                 }
             }
+            break;
         }
 
-        router.getDesign().writeCheckpoint(routed_dcp_path, t);
+        design.writeCheckpoint(routed_dcp_path, t);
 
         // partition pins
         // this works after reading constraints
@@ -488,10 +704,8 @@ public class ComposablePAT {
     }
 
     public static void main(String[] args) throws Exception {
-        //relocateToolsExample(args);
-        //copyBlueprint(args);
-        //moduleInst(args);
         CodePerfTracker t = new CodePerfTracker("ComposablePAT", true);
+
         new ComposablePAT(args).routePartial(t);
     }
 
