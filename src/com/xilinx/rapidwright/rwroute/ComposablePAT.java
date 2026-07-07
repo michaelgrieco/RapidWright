@@ -29,6 +29,7 @@ import com.xilinx.rapidwright.design.*;
 import com.xilinx.rapidwright.design.Module;
 import com.xilinx.rapidwright.design.tools.*;
 import com.xilinx.rapidwright.device.*;
+import com.xilinx.rapidwright.eco.*;
 import com.xilinx.rapidwright.edif.*;
 import com.xilinx.rapidwright.interchange.*;
 import com.xilinx.rapidwright.router.*;
@@ -343,7 +344,7 @@ public class ComposablePAT {
             Site site = inst.getSite();
             int x0 = site.getInstanceX();
             int y0 = site.getInstanceY();
-            pblock += " " + getPBlockRange(x0-xpad_left, x0+xpad_right, y0-ypad, y0+ypad);
+            pblock += " " + getPBlockRange(x0-xpad_left, x0+xpad_right, y0, y0);
 	    }
 
         // get load cell
@@ -369,6 +370,7 @@ public class ComposablePAT {
 
         // get net
         System.out.printf("Target net is %s\n", connection.net);
+        boolean is_rstn = connection.net_format.contains("o_rstn");
         Net targetNet = design.getNet(connection.net);
         System.out.printf("  => %s (%d)\n", targetNet == null ? "NULL" : targetNet.toString(), targetNet.getFanOut());
         for (SitePinInst i : targetNet.getSinkPins()) {
@@ -378,63 +380,121 @@ public class ComposablePAT {
         // get driver
         SitePinInst sourcePinInst = getSitePinInst(design, connection.source_cell, connection.source_site_pin, true, targetNet);
 
-        // get loads
-        Iterator<String> sinkCellIt = connection.sink_cells.iterator();
-        Iterator<String> sinkSitePinIt = connection.sink_site_pins.iterator();
-        String sinkCell = null;
-        while (sinkCellIt.hasNext() && sinkSitePinIt.hasNext()) {
-            sinkCell = sinkCellIt.next();
-            String sinkSitePin = sinkSitePinIt.next();
+        // find netlist to get non-leaf pin instances
+        EDIFNetlist netlist = design.getNetlist();
 
-            SitePinInst sinkPinInst = getSitePinInst(design, sinkCell, sinkSitePin, false, targetNet);
-            targetPins.add(sinkPinInst);
+        // get non-leaf drivers
+        for (String sourcePin : connection.source_hier_pins) {
+            //SitePinInst sourcePinInst = getSitePinInst(design, connection.source_cell, connection.source_site_pin, true, targetNet);
+
+            //targetNet.createPin(String pinName, SiteInst si)
+
+            // TODO export hierarchical cell of the pin
+            //int idx = sourcePin.lastIndexOf('/');
+            //Cell c = design.getCell(sourcePin.substring(0, idx));
+            //String pinName = sourcePin.substring(idx+1);
+            //targetNet.connect(c, pinName);
+            //targetNet.addPin(SitePinInst sitePinInst)
+
+            EDIFHierPortInst p = netlist.getHierPortInstFromName(sourcePin);
+            //SitePinInst spi = ECOTools.createExitSitePinInst(design, p, targetNet);
+            //targetPins.add(spi);
+
+
+            /*
+            System.out.printf("  Hier port formatted is %s:\n", sourcePort);
+            System.out.printf("    %s\n", p.toString());
+
+            Cell cell = p.getPhysicalCell(design);
+            for (SitePinInst spi : cell.getAllSitePinsFromLogicalPin(p.getPortInst().getName(), null)) {
+                System.out.printf("      => %s\n", spi.toString());
+                targetPins.add(spi);
+            }
+
+            */
         }
+
+        // get non-leaf loads
+        for (String sinkPort : connection.sink_hier_pins) {
+            EDIFHierPortInst p = netlist.getHierPortInstFromName(sinkPort);
+            //SitePinInst spi = ECOTools.createExitSitePinInst(design, p, targetNet);
+            //targetPins.add(spi);
+
+            /*EDIFHierPortInst p = netlist.getHierPortInstFromName(sinkPort);
+            System.out.printf("  Hier port formatted is %s:\n", sinkPort);
+            System.out.printf("    %s\n", p.toString());
+
+            Cell cell = p.getPhysicalCell(design);
+            for (SitePinInst spi : cell.getAllSitePinsFromLogicalPin(p.getPortInst().getName(), null)) {
+                System.out.printf("      => %s\n", spi.toString());
+                targetPins.add(spi);
+            }*/
+        }
+
+        // get loads
+        String sinkCell = connection.sink_cells.get(0);
+        String sinkSitePin = connection.sink_site_pins.get(0);
+        //if (connection.sink_cells.size() > 1) {
+        if (is_rstn) {
+            targetPins.addAll(DesignTools.createMissingSitePinInsts(design, targetNet));
+        }
+        //else {
+            Iterator<String> sinkCellIt = connection.sink_cells.iterator();
+            Iterator<String> sinkSitePinIt = connection.sink_site_pins.iterator();
+            while (sinkCellIt.hasNext() && sinkSitePinIt.hasNext()) {
+                sinkCell = sinkCellIt.next();
+                sinkSitePin = sinkSitePinIt.next();
+
+                if (!is_rstn) {
+                    SitePinInst sinkPinInst = getSitePinInst(design, sinkCell, sinkSitePin, false, targetNet);
+                    targetPins.add(sinkPinInst);
+                }
+            }
+            if (is_rstn) {
+                targetPins.add(getSitePinInst(design, sinkCell, sinkSitePin, false, targetNet));
+            }
+        //}
 
         // extend pblock to gutter and load cell
         String pblockRange = router.getRoutingPblock().toString();
-        if (connection.net_format.contains("o_rstn")) {
+        if (is_rstn) {
             pblockRange = extendPBlock(design, pblockRange, connection.source_cell, sinkCell, 1, 0, 20);
 	    }
         else {
             pblockRange = extendPBlock(design, pblockRange, null, sinkCell);
         }
-        //router.setRoutingPblock(new PBlock(design.getDevice(), pblockRange));
-        //RWRouteConfig router_config = new RWRouteConfig(new String[]{});
-        //router_config.setPBlock(pblockRange);
+        router.setRoutingPblock(new PBlock(design.getDevice(), pblockRange));
 
-        targetPins.add(sourcePinInst);
         System.out.printf("Routing to %d pins\n", targetPins.size());
-        //System.out.printf("Routing from pin %s to pin %s (cell %s)\n", sourcePinInst.toString(), sinkPinInst.toString(), connection.sink_cell);
 
-        //router.routePinsReEntrant(targetPins, false);
+        if (targetPins.size() > 1) {
+            String args[] = new String[] {
+                        "--fixBoundingBox",
+                        // use U-turn nodes and no masking of nodes cross RCLK
+                        // Pros: maximum routability
+                        // Con: might result in delay optimism and a slight increase in runtime
+                        "--useUTurnNodes",
+                        "--nonTimingDriven",
+                        "--verbose",
+                        "--pblock", pblockRange
+                    };
+            System.out.printf("args:\n");
+            for (String s : args) {
+                System.out.printf("  %s\n", s);
+            }
 
-        String args[] = new String[] {
-                    "--fixBoundingBox",
-                    // use U-turn nodes and no masking of nodes cross RCLK
-                    // Pros: maximum routability
-                    // Con: might result in delay optimism and a slight increase in runtime
-                    "--useUTurnNodes",
-                    "--nonTimingDriven",
-                    "--verbose",
-                    "--pblock", pblockRange
-                };
-        System.out.printf("args:\n");
-        for (String s : args) {
-            System.out.printf("  %s\n", s);
+            PartialRouter.preprocess(design);
+            Design newDesign =
+                PartialRouter.routeDesignWithUserDefinedArguments(
+                    design,
+                    args,
+                    targetPins,
+                    false);
+            //router.setDesign(newDesign);
         }
-
-        //RWRoute rwrouter = new PartialRouter(design, router_config, targetPins);
-        //rwrouter.preprocess();
-        //rwrouter.initialize();
-        //rwrouter.route();
-        Design newDesign =
-            PartialDFXRouter.routeDesignWithUserDefinedArguments(
-                design,
-                args,
-                targetPins,
-                false);
-        System.out.printf("Done routing\n");
-        newDesign.writeCheckpoint(routed_blueprint_dcp_path);
+        else {
+            router.routePinsReEntrant(targetPins, false);
+        }
 
         connection.net_obj = targetNet;
         return targetNet;
@@ -520,9 +580,16 @@ public class ComposablePAT {
         String source_cell;
         String sink_cell;
 
-        Collection<String> sink_cell_formats;
-        Collection<String> sink_cells;
-        Collection<String> sink_site_pins;
+        // Formats for generic cells and pins
+        List<String> sink_cell_formats;
+        List<String> source_hier_pin_formats;
+        List<String> sink_hier_pin_formats;
+        List<String> sink_site_pins;
+
+        // Formatted values
+        List<String> sink_cells;
+        List<String> source_hier_pins;
+        List<String> sink_hier_pins;
 
         // pins
         String source_site_pin;
@@ -553,9 +620,8 @@ public class ComposablePAT {
             entry("south", 0)
         );
 
-        //public StaticConnection(String direction, BufferedReader reader) throws IOException {
-        public StaticConnection(BufferedReader reader) throws IOException {
-            this.direction = reader.readLine();
+        public StaticConnection(String direction, BufferedReader reader) throws IOException {
+            this.direction = direction;
             this.crosses_pblock = !direction.equals("south");
             this.net_format = reader.readLine();
 
@@ -573,9 +639,6 @@ public class ComposablePAT {
             this.sink_site_pins = new ArrayList<String>();
             String line = reader.readLine();
             while (!line.isEmpty()) {
-                //String sink_cell_format = line;
-                //String sink_site_pin = reader.readLine();
-                //line = reader.readLine();
                 System.out.printf("  Sink cell %s\n", line);
                 this.sink_cell_formats.add(line);
                 line = reader.readLine();
@@ -584,26 +647,59 @@ public class ComposablePAT {
                 line = reader.readLine();
             }
 
+            // read source non-leaf pins
+            this.source_hier_pin_formats = new ArrayList<String>();
+            line = reader.readLine();
+            while (!line.isEmpty()) {
+                this.source_hier_pin_formats.add(line);
+                System.out.printf("  Source hier pin %s\n", line);
+                line = reader.readLine();
+            }
+
+            // read sink non-leaf pins
+            this.sink_hier_pin_formats = new ArrayList<String>();
+            line = reader.readLine();
+            while (!line.isEmpty()) {
+                this.sink_hier_pin_formats.add(line);
+                System.out.printf("  Sink hier pin %s\n", line);
+                line = reader.readLine();
+            }
+
             this.partition_node = null;
             System.out.printf("  Static connection has net %s, source site pin %s, %d sink site pins\n", this.net_format, this.source_site_pin, this.sink_site_pins.size());
         }
 
         public void format_blueprint(Device device, int r, int c, boolean is_blueprint) {
+            // get sink coordinates based on source coordinates and direction's offsets
             int sink_c = c + SINK_CELL_C_OFFSET.get(this.direction);
+            int sink_r = r + SINK_CELL_R_OFFSET.get(this.direction);
 
             this.net = String.format(this.net_format, r, c);
-            this.source_cell = String.format(this.source_cell_format, r, c);
-            //this.sink_cell = String.format(this.sink_cell_format,
-            //    r + SINK_CELL_R_OFFSET.get(this.direction),
-            //    sink_c);
 
-            this.sink_cells = new ArrayList<String>();
-            for (String format : this.sink_cell_formats) {
-                this.sink_cells.add(String.format(format,
-                    r + SINK_CELL_R_OFFSET.get(this.direction),
+            // format all sources
+            this.source_cell = String.format(this.source_cell_format, r, c);
+            this.source_hier_pins = new ArrayList<String>();
+            for (String format : this.source_hier_pin_formats) {
+                this.source_hier_pins.add(String.format(format,
+                    sink_r,
                     sink_c));
             }
 
+            // format all sinks
+            this.sink_cells = new ArrayList<String>();
+            this.sink_hier_pins = new ArrayList<String>();
+            for (String format : this.sink_cell_formats) {
+                this.sink_cells.add(String.format(format,
+                    sink_r,
+                    sink_c));
+            }
+            for (String format : this.sink_hier_pin_formats) {
+                this.sink_hier_pins.add(String.format(format,
+                    sink_r,
+                    sink_c));
+            }
+
+            // transform the coordinates of the site pins for the blueprint
             if (!is_blueprint && this.partition_wire_blueprint != null) {
                 // compute site offset relative to the blueprint
                 int tile_dy = (StaticConnection.blueprint_r - r) * 60;
@@ -697,23 +793,27 @@ public class ComposablePAT {
         ArrayList<StaticConnection> nets = new ArrayList<StaticConnection>();
         BufferedReader reader = new BufferedReader(new FileReader(inter_pe_nets_path));
         System.out.printf("Reading from %s\n", inter_pe_nets_path);
-        while (true) {
+        String line = reader.readLine();
+        while (line != null) {
             // reset pblock
             router.setRoutingPblock(new PBlock(design.getDevice(), base_range));
 
             // read and transform names
-            StaticConnection connection = new StaticConnection(reader);
+            StaticConnection connection = new StaticConnection(line, reader);
             connection.format_blueprint(design.getDevice(), r, c, true);
 
             // route
             routeInterPENetPins(design, router, connection);
-            //nets.add(connection);
-            break;
+            design = router.getDesign();
+            nets.add(connection);
+
+            line = reader.readLine();
+            //break;
         }
 
         // find partition nodes for each net
         for (StaticConnection connection : nets) {
-            //connection.computePartitionPin(x1);
+            connection.computePartitionPin(x1);
         }
 
         return nets;
@@ -730,7 +830,6 @@ public class ComposablePAT {
 
         System.out.printf("Routing inter-PE region %d, %d\n", r, c);
 
-        //ArrayList<Connection> connections = new ArrayList<Connection>();
         for (StaticConnection static_connection : static_connections) {
             System.out.printf("Routing connection %s to (%d, %d)\n", static_connection.net_format, r, c);
             static_connection.format(design.getDevice(), r, c);
@@ -776,7 +875,7 @@ public class ComposablePAT {
             throw e;
         }
 
-        //router.getDesign().writeCheckpoint(routed_blueprint_dcp_path, t);
+        router.getDesign().writeCheckpoint(routed_blueprint_dcp_path, t);
         //design.writeCheckpoint(routed_blueprint_dcp_path, t);
 
         if (router != null) return;
